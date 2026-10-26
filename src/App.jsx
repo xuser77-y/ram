@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react';
 import './App.css';
 import {
   AIRPORTS, airportByCode, DESTINATIONS, FALLBACK_IMG, HERO_IMG,
-  mockFlights, mockFlightStatus, OFFERS, PERKS, QUICK_LINKS,
+  OFFERS, PERKS, QUICK_LINKS,
 } from './data.js';
 
 const NAV_LINKS = ['Book', 'Manage', 'Flight status', 'Offers', 'Loyalty', 'Help'];
@@ -11,8 +11,25 @@ const NAV_TARGETS = {
   Offers: '#offers', Loyalty: '#loyalty', Help: '#footer',
 };
 
+const SERVER_DOWN = 'Could not reach the server. Start the API first with: npm run server';
+
 function todayISO() {
   return new Date().toISOString().slice(0, 10);
+}
+
+// Thin wrapper over the API (proxied to http://localhost:5000 in dev).
+// Throws an Error carrying the server's message, or SERVER_DOWN when the
+// API is unreachable. It never falls back to fake data.
+async function api(path, options) {
+  let res;
+  try {
+    res = await fetch(path, options);
+  } catch {
+    throw new Error(SERVER_DOWN);
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status}).`);
+  return data;
 }
 
 export default function App() {
@@ -25,19 +42,31 @@ export default function App() {
   const [passengers, setPassengers] = useState(1);
   const [results, setResults] = useState(null);
   const [searchError, setSearchError] = useState('');
+  const [searchLoading, setSearchLoading] = useState(false);
   const [selected, setSelected] = useState(null);
+
+  const [showPassengerForm, setShowPassengerForm] = useState(false);
+  const [passengerFields, setPassengerFields] = useState([]);
+  const [bookingLoading, setBookingLoading] = useState(false);
+  const [bookingError, setBookingError] = useState('');
+  const [bookingConfirmation, setBookingConfirmation] = useState(null);
 
   const [ref, setRef] = useState('');
   const [lastName, setLastName] = useState('');
   const [bookingCard, setBookingCard] = useState(null);
+  const [manageError, setManageError] = useState('');
+  const [manageLoading, setManageLoading] = useState(false);
 
   const [flightNo, setFlightNo] = useState('');
   const [flightDate, setFlightDate] = useState(todayISO());
   const [flightStatus, setFlightStatus] = useState(null);
   const [statusError, setStatusError] = useState('');
+  const [statusLoading, setStatusLoading] = useState(false);
 
   const [newsletterEmail, setNewsletterEmail] = useState('');
   const [newsletterDone, setNewsletterDone] = useState(false);
+  const [newsletterError, setNewsletterError] = useState('');
+  const [newsletterLoading, setNewsletterLoading] = useState(false);
   const [loyaltyDone, setLoyaltyDone] = useState(false);
   const [toast, setToast] = useState('');
 
@@ -50,39 +79,104 @@ export default function App() {
     showToast._t = window.setTimeout(() => setToast(''), 4000);
   }
 
-  function handleSearch(e) {
-    e.preventDefault();
+  function resetBookingFlow() {
+    setResults(null);
     setSelected(null);
+    setShowPassengerForm(false);
+    setPassengerFields([]);
+    setBookingError('');
+    setBookingConfirmation(null);
+  }
+
+  async function handleSearch(e) {
+    e.preventDefault();
+    resetBookingFlow();
     if (from === to) {
-      setResults(null);
       setSearchError('Departure and arrival airports must be different.');
       return;
     }
     setSearchError('');
-    setResults(mockFlights(from, to));
-    document.getElementById('search-results')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setSearchLoading(true);
+    try {
+      const data = await api(
+        `/api/flights?from=${from}&to=${to}&date=${depart}&passengers=${passengers}`,
+      );
+      setResults(data.flights);
+      document.getElementById('search-results')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (err) {
+      setSearchError(err.message);
+    } finally {
+      setSearchLoading(false);
+    }
   }
 
-  function handleManage(e) {
+  function openPassengerForm() {
+    setPassengerFields(Array.from({ length: passengers }, () => ({ firstName: '', lastName: '', email: '' })));
+    setBookingError('');
+    setShowPassengerForm(true);
+    document.getElementById('passenger-form')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function updatePassengerField(i, field, value) {
+    setPassengerFields((fields) => fields.map((f, j) => (j === i ? { ...f, [field]: value } : f)));
+  }
+
+  async function handleBookingSubmit(e) {
+    e.preventDefault();
+    setBookingError('');
+    setBookingLoading(true);
+    try {
+      const data = await api('/api/bookings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          flightId: selected.id,
+          passengers: passengerFields,
+          tripType,
+          departDate: depart,
+          returnDate: tripType === 'round' ? ret : null,
+        }),
+      });
+      setBookingConfirmation(data.booking);
+      setShowPassengerForm(false);
+    } catch (err) {
+      setBookingError(err.message);
+    } finally {
+      setBookingLoading(false);
+    }
+  }
+
+  async function handleManage(e) {
     e.preventDefault();
     if (!ref.trim() || !lastName.trim()) return;
-    const dests = DESTINATIONS;
-    const n = ref.replace(/\D/g, '').length;
-    const dest = dests[n % dests.length];
-    setBookingCard({
-      ref: ref.trim().toUpperCase(),
-      name: lastName.trim(),
-      from: 'CMN',
-      to: dest.code,
-      fromCity: 'Casablanca',
-      toCity: dest.city,
-      date: depart,
-      flight: `AT${100 + ((n * 37) % 800)}`,
-      status: 'Confirmed',
-    });
+    setManageError('');
+    setBookingCard(null);
+    setManageLoading(true);
+    try {
+      const data = await api(
+        `/api/bookings/${encodeURIComponent(ref.trim())}?lastName=${encodeURIComponent(lastName.trim())}`,
+      );
+      const b = data.booking;
+      setBookingCard({
+        ref: b.reference,
+        fromCity: b.flight.fromCity,
+        toCity: b.flight.toCity,
+        from: b.flight.from,
+        to: b.flight.to,
+        flight: b.flight.number,
+        date: b.departDate,
+        passengers: b.passengers.map((p) => `${p.firstName} ${p.lastName}`).join(', '),
+        totalPrice: b.totalPrice,
+        status: b.status,
+      });
+    } catch (err) {
+      setManageError(err.message);
+    } finally {
+      setManageLoading(false);
+    }
   }
 
-  function handleStatus(e) {
+  async function handleStatus(e) {
     e.preventDefault();
     if (!/^AT\d+$/i.test(flightNo.trim())) {
       setFlightStatus(null);
@@ -90,15 +184,44 @@ export default function App() {
       return;
     }
     setStatusError('');
-    setFlightStatus(mockFlightStatus(flightNo.trim(), flightDate));
+    setFlightStatus(null);
+    setStatusLoading(true);
+    try {
+      const data = await api(
+        `/api/flights/${encodeURIComponent(flightNo.trim())}/status?date=${flightDate}`,
+      );
+      setFlightStatus(data);
+    } catch (err) {
+      setStatusError(err.message);
+    } finally {
+      setStatusLoading(false);
+    }
+  }
+
+  async function handleNewsletter(e) {
+    e.preventDefault();
+    if (!newsletterEmail.trim()) return;
+    setNewsletterError('');
+    setNewsletterLoading(true);
+    try {
+      await api('/api/newsletter', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: newsletterEmail.trim() }),
+      });
+      setNewsletterDone(true);
+    } catch (err) {
+      setNewsletterError(err.message);
+    } finally {
+      setNewsletterLoading(false);
+    }
   }
 
   function prefillDestination(code) {
     setFrom('CMN');
     setTo(code);
     setTab('booking');
-    setResults(null);
-    setSelected(null);
+    resetBookingFlow();
     document.getElementById('booking')?.scrollIntoView({ behavior: 'smooth' });
   }
 
@@ -205,7 +328,9 @@ export default function App() {
                 </label>
               </div>
               {searchError && <p className="form-error">{searchError}</p>}
-              <button className="btn-primary" type="submit">Search flights</button>
+              <button className="btn-primary" type="submit" disabled={searchLoading}>
+                {searchLoading ? 'Searching…' : 'Search flights'}
+              </button>
             </form>
           )}
 
@@ -215,20 +340,23 @@ export default function App() {
               <div className="form-grid two-col">
                 <label>
                   Booking reference
-                  <input value={ref} onChange={(e) => setRef(e.target.value)} placeholder="e.g. ABC123" required />
+                  <input value={ref} onChange={(e) => setRef(e.target.value)} placeholder="e.g. AT3K7X9Q" required />
                 </label>
                 <label>
                   Last name
                   <input value={lastName} onChange={(e) => setLastName(e.target.value)} placeholder="e.g. Fikri" required />
                 </label>
               </div>
-              <button className="btn-primary" type="submit">Find my booking</button>
+              {manageError && <p className="form-error">{manageError}</p>}
+              <button className="btn-primary" type="submit" disabled={manageLoading}>
+                {manageLoading ? 'Looking up…' : 'Find my booking'}
+              </button>
               {bookingCard && (
                 <div className="booking-card">
                   <div>
                     <strong>{bookingCard.fromCity} ({bookingCard.from}) → {bookingCard.toCity} ({bookingCard.to})</strong>
-                    <p>Flight {bookingCard.flight} · {bookingCard.date} · Passenger: {bookingCard.name}</p>
-                    <p>Reference: {bookingCard.ref}</p>
+                    <p>Flight {bookingCard.flight} · {bookingCard.date} · Passengers: {bookingCard.passengers}</p>
+                    <p>Reference: {bookingCard.ref} · Total: {bookingCard.totalPrice.toLocaleString()} MAD</p>
                   </div>
                   <span className="status-pill ok">{bookingCard.status}</span>
                 </div>
@@ -250,12 +378,14 @@ export default function App() {
                 </label>
               </div>
               {statusError && <p className="form-error">{statusError}</p>}
-              <button className="btn-primary" type="submit">Check status</button>
+              <button className="btn-primary" type="submit" disabled={statusLoading}>
+                {statusLoading ? 'Checking…' : 'Check status'}
+              </button>
               {flightStatus && (
                 <div className="booking-card">
                   <div>
                     <strong>{flightStatus.flight} · {flightStatus.fromCity} ({flightStatus.from}) → {flightStatus.toCity} ({flightStatus.to})</strong>
-                    <p>Departs {flightStatus.dep} · Arrives {flightStatus.arr} · {flightStatus.date}</p>
+                    <p>Departs {flightStatus.dep} · Arrives {flightStatus.arr} · {flightStatus.date || '—'}</p>
                     <p>{flightStatus.note}</p>
                   </div>
                   <span className={`status-pill ${flightStatus.status === 'Delayed' ? 'warn' : 'ok'}`}>{flightStatus.status}</span>
@@ -273,15 +403,15 @@ export default function App() {
             {fromAirport.city} ({from}) → {toAirport.city} ({to}) · {depart}
             {tripType === 'round' ? ` · return ${ret}` : ' · one way'} · {passengers} {passengers === 1 ? 'passenger' : 'passengers'}
           </h2>
-          <p className="results-note">Demo fares in MAD, per person. Select a flight to see your trip summary.</p>
+          <p className="results-note">Fares in MAD, per person, from the live schedule. Select a flight to book it.</p>
           <div className="flight-list">
             {results.map((f) => (
               <button
                 key={f.id}
                 className={`flight-row ${selected?.id === f.id ? 'selected' : ''}`}
-                onClick={() => setSelected(f)}
+                onClick={() => { setSelected(f); setShowPassengerForm(false); setBookingConfirmation(null); }}
               >
-                <span className="flight-no">{f.id}</span>
+                <span className="flight-no">{f.number}</span>
                 <span className="flight-times">{f.dep} → {f.arr}</span>
                 <span className="flight-meta">{f.duration} · {f.stops}</span>
                 <span className="flight-price">{f.price.toLocaleString()} MAD</span>
@@ -289,16 +419,59 @@ export default function App() {
             ))}
           </div>
 
-          {selected && (
+          {selected && !bookingConfirmation && (
             <div className="trip-summary">
               <h3>Your trip summary</h3>
-              <p><strong>{selected.id}</strong> · {fromAirport.city} ({from}) → {toAirport.city} ({to})</p>
+              <p><strong>{selected.number}</strong> · {fromAirport.city} ({from}) → {toAirport.city} ({to})</p>
               <p>Departure {depart} at {selected.dep} · Arrival {selected.arr} · {selected.duration} · {selected.stops}</p>
               <p>{passengers} × {selected.price.toLocaleString()} MAD = <strong>{totalPrice.toLocaleString()} MAD</strong></p>
-              {tripType === 'round' && <p>Return date: {ret} (return flight to be selected at checkout in the full version).</p>}
-              <button className="btn-primary" onClick={() => showToast('Demo checkout is not wired up — your selection is saved above.')}>
-                Continue to checkout
+              {tripType === 'round' && <p>Return date: {ret} (return flight selection is not part of this booking).</p>}
+              {!showPassengerForm && (
+                <button className="btn-primary" onClick={openPassengerForm}>
+                  Continue to booking
+                </button>
+              )}
+            </div>
+          )}
+
+          {selected && showPassengerForm && !bookingConfirmation && (
+            <form className="search-form" id="passenger-form" onSubmit={handleBookingSubmit}>
+              <h3>Passenger details</h3>
+              {passengerFields.map((p, i) => (
+                <div className="form-grid" key={i}>
+                  <label>
+                    Passenger {i + 1} — first name
+                    <input value={p.firstName} onChange={(e) => updatePassengerField(i, 'firstName', e.target.value)} required />
+                  </label>
+                  <label>
+                    Last name
+                    <input value={p.lastName} onChange={(e) => updatePassengerField(i, 'lastName', e.target.value)} required />
+                  </label>
+                  <label>
+                    Email
+                    <input type="email" value={p.email} onChange={(e) => updatePassengerField(i, 'email', e.target.value)} required />
+                  </label>
+                </div>
+              ))}
+              {bookingError && <p className="form-error">{bookingError}</p>}
+              <button className="btn-primary" type="submit" disabled={bookingLoading}>
+                {bookingLoading ? 'Booking…' : `Confirm booking — ${totalPrice.toLocaleString()} MAD`}
               </button>
+            </form>
+          )}
+
+          {bookingConfirmation && (
+            <div className="trip-summary">
+              <h3>Booking confirmed</h3>
+              <p>Your booking reference is <strong>{bookingConfirmation.reference}</strong> — keep it to manage or check in.</p>
+              <p><strong>{bookingConfirmation.flight.number}</strong> · {bookingConfirmation.flight.fromCity} ({bookingConfirmation.flight.from}) → {bookingConfirmation.flight.toCity} ({bookingConfirmation.flight.to})</p>
+              <p>Departure {bookingConfirmation.departDate} at {bookingConfirmation.flight.dep} · Arrival {bookingConfirmation.flight.arr} · {bookingConfirmation.flight.duration}</p>
+              <p>Passengers: {bookingConfirmation.passengers.map((p) => `${p.firstName} ${p.lastName}`).join(', ')}</p>
+              <p>Total paid (demo — no payment taken): <strong>{bookingConfirmation.totalPrice.toLocaleString()} MAD</strong></p>
+              <span className="status-pill ok">{bookingConfirmation.status}</span>
+              <div>
+                <button className="btn-primary" onClick={resetBookingFlow}>Book another flight</button>
+              </div>
             </div>
           )}
         </section>
@@ -387,7 +560,7 @@ export default function App() {
         {newsletterDone
           ? <p className="success">Thanks for subscribing! You will receive our next newsletter.</p>
           : (
-            <form className="newsletter-form" onSubmit={(e) => { e.preventDefault(); if (newsletterEmail.trim()) setNewsletterDone(true); }}>
+            <form className="newsletter-form" onSubmit={handleNewsletter}>
               <input
                 type="email"
                 placeholder="Your email address"
@@ -395,7 +568,10 @@ export default function App() {
                 onChange={(e) => setNewsletterEmail(e.target.value)}
                 required
               />
-              <button className="btn-primary" type="submit">Subscribe</button>
+              <button className="btn-primary" type="submit" disabled={newsletterLoading}>
+                {newsletterLoading ? 'Subscribing…' : 'Subscribe'}
+              </button>
+              {newsletterError && <p className="form-error">{newsletterError}</p>}
             </form>
           )}
       </section>
